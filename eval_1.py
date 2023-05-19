@@ -9,11 +9,13 @@ import scipy.io as sio
 import h5py
 from os.path import exists, join, basename
 import torch.utils.data as data
-from model.model_0512 import *
+from model.model_0515 import *
 import torch.nn.functional as F
 # from cal_ssim import SSIM
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+name = '/cave11-0515.mat'
 
 class DatasetFromHdf5(data.Dataset):
     def __init__(self, file_path):
@@ -54,7 +56,7 @@ parser.add_argument('--testBatchSize', type=int, default=1, help='testing batch 
 parser.add_argument('--threads', type=int, default=4, help='number of threads for data loader to use')
 parser.add_argument('--cuda', action='store_true', help='use cuda?')
 parser.add_argument('--model_path', type=str,
-                    default='/home/ubuntu/106-48t/personal_data/yj/local/checkpoints/PSRT_cave_x4_202305130030/model_epoch_2000.pth.tar',
+                    default='/home/ubuntu/106-48t/personal_data/yj/local/checkpoints/PSRT_cave_x4_202305171102/model_epoch_2000.pth.tar',
                     help='path for trained encoder')
 opt = parser.parse_args()
 
@@ -141,7 +143,8 @@ def test(test_data_loader):
     print('SAM:   {:.4f};'.format(np.array(sam_list).mean()))
     print('ERGAS:   {:.4f};'.format(np.array(ergas_list).mean()))
     print('SSIM:   {:.4f};'.format(np.array(ssim_list).mean()))
-    sio.savemat('./results/cave11-0512.mat', {'output': output})
+
+    sio.savemat('./results' + name, {'output': output})
 
 
 
@@ -152,4 +155,9 @@ def test(test_data_loader):
 
 test(test_data_loader)
 
-
+file_path = '/home/ubuntu/106-48t/personal_data/yj/local/results' + name
+PATH = '/home/ubuntu/106-48t/personal_data/yj/local/merge'
+data_dic = sio.loadmat(file_path)
+result = data_dic['output']
+result = rearrange(result, '(b h1 w1) h w c  -> b (h1 h) (w1 w) c', h1=2, w1=2, b=11)
+sio.savemat(PATH + name,{'output':result})
