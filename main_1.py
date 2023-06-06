@@ -7,7 +7,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.optim
 from torch import nn
-from model.model_0517 import *
+from model.model_0605 import *
 import args_parser
 import h5py
 from torch.nn import functional as F
@@ -18,16 +18,22 @@ import random
 from metrics import calc_psnr, calc_rmse, calc_ergas, calc_sam, calc_ssim
 from cal_ssim import SSIM, set_random_seed
 from torch.autograd import Variable
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 
+local_rank = int(os.environ["LOCAL_RANK"])
 
+    
 class DatasetFromHdf5(data.Dataset):
     def __init__(self, file_path):
         super(DatasetFromHdf5, self).__init__()
         dataset = h5py.File(file_path, 'r')
-        print(dataset.keys())
+        if local_rank ==0:
+            print(dataset.keys())
         self.GT = dataset.get("GT")
-        print(self.GT.shape)
+        if local_rank ==0:
+            print(self.GT.shape)
         self.UP = dataset.get("HSI_up")
         self.LRHSI = dataset.get("LRHSI")
         self.RGB = dataset.get("RGB")
@@ -55,33 +61,45 @@ def get_val_set(root_dir):
 
 opt = args_parser.args_parser()
 # os.environ["CUDA_VISIBLE_DEVICES"] = "4, 5"
-print(opt)
+if local_rank ==0:
+    print(opt)
+
+if opt.local_rank != -1:
+    torch.cuda.set_device(opt.local_rank)
+    device=torch.device("cuda", opt.local_rank)
+    torch.distributed.init_process_group(backend="nccl")#, init_method='env://'
 
 device_ids = [i for i in range(torch.cuda.device_count())]
+num_gpus = torch.cuda.device_count()
 
-def save_checkpoint(model, epoch, t, data):
+def save_checkpoint(model, epoch, optimizer, t, data):
     model_out_path = "checkpoints/{}_{}_{}/model_epoch_{}.pth.tar".format(opt.arch, data,t,epoch)
 
-    if device_ids == 1:
-        state = {"epoch": epoch, "model": model}
-    else:
-        state = {"epoch": epoch, "model": model.module}
+    # try device_ids == 1:
+    #     state = {"epoch": epoch, "model": model}
+    # except:
+    #     state = {"epoch": epoch, "model": model.module}
+    state = {"epoch": epoch, "model": model.module.state_dict(), "optimizer":optimizer}
 
     if not os.path.exists("checkpoints/{}_{}_{}".format(opt.arch, data,t,epoch)):
         os.makedirs("checkpoints/{}_{}_{}".format(opt.arch, data, t,epoch))
 
     torch.save(state, model_out_path)
- 
-    print("Checkpoints saved to {}".format(model_out_path))
+    if local_rank ==0:
+        print("Checkpoints saved to {}".format(model_out_path))
 
 def main():
     # load data
-    print('===> Loading datasets')
+    if local_rank ==0:
+        print('===> Loading datasets')
     train_set = get_training_set(opt.dataroot)#parser里改成数据集路径
     val_set = get_val_set(opt.dataroot)
 
-    training_data_loader = DataLoader(dataset=train_set, batch_size=opt.batchSize, shuffle=True)
-    val_data_loader = DataLoader(dataset=val_set, batch_size=opt.testBatchSize, shuffle=False)
+    train_sampler = DistributedSampler(train_set)
+    val_sampler = DistributedSampler(val_set)
+
+    training_data_loader = DataLoader(dataset=train_set, batch_size=opt.batchSize, shuffle=False, num_workers=4, sampler=train_sampler, pin_memory=False)
+    val_data_loader = DataLoader(dataset=val_set, batch_size=opt.testBatchSize, shuffle=False, num_workers=4, sampler=val_sampler, pin_memory=False)
 
 
     if opt.dataset == 'pavia_x4':#parser里改成数据集名称
@@ -104,13 +122,20 @@ def main():
 
     # Build the models
     model = PSRTnet(opt).cuda()
-    model = torch.nn.DataParallel(model)
+    # model = torch.nn.DataParallel(model)
+    if num_gpus > 1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(model,
+                                                        device_ids=[opt.local_rank],
+                                                        output_device=opt.local_rank,
+                                                        find_unused_parameters=True)
 
     input1 = torch.randn(1, 3, opt.image_size, opt.image_size).cuda()
     input2 = torch.randn(1, 31, opt.image_size, opt.image_size).cuda()
 
     from fvcore.nn import FlopCountAnalysis, flop_count_table
-    print(flop_count_table(FlopCountAnalysis(model, (input1, input2))))
+    if local_rank ==0:
+        print(flop_count_table(FlopCountAnalysis(model, (input1, input2))))
 
     # Loss and optimizer
     g_ssim = SSIM(size_average=True)
@@ -143,12 +168,26 @@ def main():
 
     # Epochs
     model.train()
-    print ('Start Training: ')
+    if local_rank ==0:
+        print ('Start Training: ')
     t = time.strftime("%Y%m%d%H%M")
+
+    #断点恢复
+    # if RESUME:
+    #     path_checkpoint = "./models/checkpoint/ckpt_best_1.pth"  # 断点路径
+    #     checkpoint = torch.load(path_checkpoint)  # 加载断点
+
+    #     model.load_state_dict(checkpoint['net'])  # 加载模型可学习参数
+
+    #     optimizer.load_state_dict(checkpoint['optimizer'])  # 加载优化器参数
+    #     start_epoch = checkpoint['epoch']  # 设置开始的epoch
+
     for epoch in range(opt.start_epochs, opt.n_epochs+1):
+        train_sampler.set_epoch(epoch)
         # One epoch's training
-        print ('Train_Epoch_{}: '.format(epoch))
-        print("epoch =", epoch, "lr =", optimizer.param_groups[0]["lr"])
+        if local_rank ==0:
+            print ('Train_Epoch_{}: '.format(epoch))
+            print("epoch =", epoch, "lr =", optimizer.param_groups[0]["lr"])
 
         for iteration, batch in enumerate(training_data_loader, 1):
             input_rgb, _, input_lr_u, ref = Variable(batch[0]).cuda(), Variable(batch[1]).cuda(), Variable( batch[2]).cuda(), Variable(batch[3], requires_grad=False).cuda()
@@ -171,8 +210,9 @@ def main():
             optimizer.step()
 
             if iteration % 10 == 0:
-                print("===> Epoch[{}]({}/{}): Loss: {:.10f}".format(epoch, iteration, len(training_data_loader),
-                                                                    loss.item()))
+                if local_rank == 0:
+                    print("===> Epoch[{}]({}/{}): Loss: {:.10f}".format(epoch, iteration, len(training_data_loader),
+                                                                        loss.item()))
 
         model.eval()
         with torch.no_grad():
@@ -188,19 +228,20 @@ def main():
             ergas = calc_ergas(ref, out)
             sam = calc_sam(ref, out)
             # ssim = calc_ssim(ref, out, patch_size = ref.shape[2])
-
-            print('RMSE:   {:.4f};'.format(rmse))
-            print('PSNR:   {:.4f};'.format(psnr))
-            print('ERGAS:   {:.4f};'.format(ergas))
-            print('SAM:   {:.4f}.'.format(sam))
-            # print('SSIM:   {:.4f}.'.format(ssim))
-            #对每个epoch的loss记录
-            fp = open('./log/0517.txt', 'a')
-            fp.write('epoch'+ str(epoch) + ':' + '\t' + 'psnr=' + str(psnr) + '\n')
-            fp.close() 
+            if local_rank == 0:
+                print('RMSE:   {:.4f};'.format(rmse))
+                print('PSNR:   {:.4f};'.format(psnr))
+                print('ERGAS:   {:.4f};'.format(ergas))
+                print('SAM:   {:.4f}.'.format(sam))
+                # print('SSIM:   {:.4f}.'.format(ssim))
+                #对每个epoch的loss记录
+                fp = open('./log/0605.txt', 'a')
+                fp.write('epoch'+ str(epoch) + ':' + '\t' + 'psnr=' + str(psnr) + '\n')
+                fp.close() 
 
         if epoch % 50 == 0:
-            save_checkpoint(model, epoch, t, opt.dataset)
+            if local_rank ==0:
+                save_checkpoint(model, epoch, optimizer, t, opt.dataset)
 
 
 if __name__ == '__main__':

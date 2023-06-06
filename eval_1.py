@@ -1,3 +1,5 @@
+#分布式训练后测试
+
 import numpy as np
 from metrics import calc_psnr, calc_ergas, calc_sam, calc_ssim
 import argparse
@@ -9,13 +11,18 @@ import scipy.io as sio
 import h5py
 from os.path import exists, join, basename
 import torch.utils.data as data
-from model.model_0515 import *
+from model.model_SR import *
 import torch.nn.functional as F
+# import torch.distributed as dist
+# from torch.utils.data.distributed import DistributedSampler
 # from cal_ssim import SSIM
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-name = '/cave11-0515.mat'
+
+# local_rank  = os.getenv('LOCAL_RANK', 0)
+
+name = '/cave11-PSRT_1.mat'
 
 class DatasetFromHdf5(data.Dataset):
     def __init__(self, file_path):
@@ -56,12 +63,22 @@ parser.add_argument('--testBatchSize', type=int, default=1, help='testing batch 
 parser.add_argument('--threads', type=int, default=4, help='number of threads for data loader to use')
 parser.add_argument('--cuda', action='store_true', help='use cuda?')
 parser.add_argument('--model_path', type=str,
-                    default='/home/ubuntu/106-48t/personal_data/yj/local/checkpoints/PSRT_cave_x4_202305171102/model_epoch_2000.pth.tar',
+                    default='/home/ubuntu/106-48t/personal_data/yj/local/checkpoints/PSRT_cave_x4_202306021138/model_epoch_2000.pth.tar',
                     help='path for trained encoder')
+# parser.add_argument("--local_rank", default=os.getenv('LOCAL_RANK', 0), type=int)
 opt = parser.parse_args()
 
+# local_rank = int(os.environ["LOCAL_RANK"])
+
+# if opt.local_rank != -1:
+#     torch.cuda.set_device(opt.local_rank)
+#     device=torch.device("cuda", opt.local_rank)
+#     torch.distributed.init_process_group(backend="nccl")#, init_method='env://'
+
+
 test_set = get_test_set(opt.dataset)
-test_data_loader = DataLoader(dataset=test_set,  batch_size=opt.testBatchSize, shuffle=False)
+# test_sampler = DistributedSampler(test_set)
+test_data_loader = DataLoader(dataset=test_set,  batch_size=opt.testBatchSize, shuffle=False,pin_memory=False)
 
 
 def cleanup_state_dict(state_dict):
@@ -78,26 +95,14 @@ def test(test_data_loader):
     model = PSRTnet(opt).cuda()
 
     checkpoint = torch.load(opt.model_path)
-    # print(opt.model_path)
-    # model.load_state_dict(checkpoint["model"].state_dict())
-
-    # model = torch.load(opt.model_path)
-
-    # if you want to use the pretrained checkpoints, use the blow code instead.
-    # state_dict = checkpoint['model']
-    # dict = {}
-    # for module in state_dict.items():
-    #     k, v = module
-    #     if 'model' in k:
-    #         k = k.strip('model.')
-    #     dict[k] = v
-    # checkpoint['state_dict'] = dict
-    # model.load_state_dict(checkpoint['state_dict'])
-
-    model.load_state_dict(cleanup_state_dict(checkpoint["model"].state_dict()))
-    
-
-
+    # try:
+    #     model.load_state_dict(checkpoint["model"].state_dict())
+    # except:
+    #     model.load_state_dict(checkpoint["model"].module.state_dict())
+    try:
+        model.load_state_dict(checkpoint["model"])
+    except:
+        model.load_state_dict(checkpoint["model"].module)
     model.eval()
     output = np.zeros((44, opt.image_size, opt.image_size, opt.n_bands))
     
